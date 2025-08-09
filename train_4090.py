@@ -51,8 +51,8 @@ def parse_args():
     )
     args = parser.parse_args()
 
-
     return args.config
+
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -67,6 +67,7 @@ class ToyDataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
 
 def lora_processors(model):
     processors = {}
@@ -84,6 +85,111 @@ def lora_processors(model):
         fn_recursive_add_processors(name, module, processors)
 
     return processors
+
+
+def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise_scheduler_copy,
+                           validation_dataloader, accelerator, weight_dtype, get_sigmas):
+    """Compute validation loss on the validation dataset."""
+    flux_transformer.eval()
+    total_val_loss = 0.0
+    num_val_batches = 0
+
+    with torch.no_grad():
+        for val_batch in validation_dataloader:
+            if len(val_batch) == 3:  # With cached embeddings
+                img, prompt_embeds, prompt_embeds_mask = val_batch
+                prompt_embeds, prompt_embeds_mask = prompt_embeds.to(dtype=weight_dtype).to(accelerator.device), prompt_embeds_mask.to(dtype=torch.int32).to(accelerator.device)
+            else:  # Without cached embeddings
+                img, prompts = val_batch
+                prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
+                    prompt=prompts,
+                    device=accelerator.device,
+                    num_images_per_prompt=1,
+                    max_sequence_length=1024,
+                )
+
+            # Handle image processing
+            if isinstance(img, torch.Tensor):  # Cached embeddings
+                pixel_latents = img.to(dtype=weight_dtype).to(accelerator.device)
+            else:  # Raw images
+                pixel_values = img.to(dtype=weight_dtype).to(accelerator.device)
+                pixel_values = pixel_values.unsqueeze(2)
+                pixel_latents = vae.encode(pixel_values).latent_dist.sample()
+
+            pixel_latents = pixel_latents.permute(0, 2, 1, 3, 4)
+
+            latents_mean = (
+                torch.tensor(vae.config.latents_mean)
+                .view(1, 1, vae.config.z_dim, 1, 1)
+                .to(pixel_latents.device, pixel_latents.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(vae.config.latents_std).view(1, 1, vae.config.z_dim, 1, 1).to(
+                pixel_latents.device, pixel_latents.dtype
+            )
+            pixel_latents = (pixel_latents - latents_mean) * latents_std
+
+            bsz = pixel_latents.shape[0]
+            noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
+            u = compute_density_for_timestep_sampling(
+                weighting_scheme="none",
+                batch_size=bsz,
+                logit_mean=0.0,
+                logit_std=1.0,
+                mode_scale=1.29,
+            )
+            indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+            timesteps = noise_scheduler_copy.timesteps[indices].to(device=pixel_latents.device)
+
+            sigmas = get_sigmas(timesteps, n_dim=pixel_latents.ndim, dtype=pixel_latents.dtype)
+            noisy_model_input = (1.0 - sigmas) * pixel_latents + sigmas * noise
+
+            packed_noisy_model_input = QwenImagePipeline._pack_latents(
+                noisy_model_input,
+                bsz,
+                noisy_model_input.shape[2],
+                noisy_model_input.shape[3],
+                noisy_model_input.shape[4],
+            )
+
+            img_shapes = [(1, noisy_model_input.shape[3] // 2, noisy_model_input.shape[4] // 2)] * bsz
+
+            txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+
+            model_pred = flux_transformer(
+                hidden_states=packed_noisy_model_input,
+                timestep=timesteps / 1000,
+                guidance=None,
+                encoder_hidden_states_mask=prompt_embeds_mask,
+                encoder_hidden_states=prompt_embeds,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                return_dict=False,
+            )[0]
+
+            vae_scale_factor = 2 ** len(vae.temperal_downsample)
+            model_pred = QwenImagePipeline._unpack_latents(
+                model_pred,
+                height=noisy_model_input.shape[3] * vae_scale_factor,
+                width=noisy_model_input.shape[4] * vae_scale_factor,
+                vae_scale_factor=vae_scale_factor,
+            )
+
+            weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
+            target = noise - pixel_latents
+            target = target.permute(0, 2, 1, 3, 4)
+            loss = torch.mean(
+                (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                1,
+            )
+            loss = loss.mean()
+
+            total_val_loss += loss.item()
+            num_val_batches += 1
+
+    avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0.0
+    flux_transformer.train()
+    return avg_val_loss
+
 
 def main():
     args = OmegaConf.load(parse_args())
@@ -117,7 +223,6 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
-
 
     if accelerator.is_main_process:
         if args.output_dir is not None:
@@ -159,7 +264,6 @@ def main():
         torch.cuda.empty_cache()
     del text_encoding_pipeline
     gc.collect()
-
 
     vae = AutoencoderKLQwenImage.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -237,7 +341,6 @@ def main():
 
     flux_transformer.requires_grad_(False)
 
-
     flux_transformer.train()
     optimizer_cls = torch.optim.AdamW
     for n, param in flux_transformer.named_parameters():
@@ -264,6 +367,80 @@ def main():
             eps=args.adam_epsilon,
         )
     train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, **args.data_config)
+
+    # Setup validation dataset if validation_config is provided
+    validation_dataloader = None
+    if hasattr(args, 'validation_config') and args.validation_config is not None:
+        logger.info("Setting up validation dataset...")
+        # For validation, we need to handle both cached and non-cached cases
+        val_cached_text_embeddings = None
+        val_cached_image_embeddings = None
+
+        if args.precompute_text_embeddings and hasattr(args.validation_config, 'img_dir'):
+            # Precompute validation text embeddings
+            val_cached_text_embeddings = {}
+            text_encoding_pipeline_val = QwenImagePipeline.from_pretrained(
+                args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
+            )
+            text_encoding_pipeline_val.to(accelerator.device)
+            with torch.no_grad():
+                for txt in tqdm([i for i in os.listdir(args.validation_config.img_dir) if ".txt" in i]):
+                    txt_path = os.path.join(args.validation_config.img_dir, txt)
+                    prompt = open(txt_path).read()
+                    prompt_embeds, prompt_embeds_mask = text_encoding_pipeline_val.encode_prompt(
+                        prompt=[prompt],
+                        device=text_encoding_pipeline_val.device,
+                        num_images_per_prompt=1,
+                        max_sequence_length=1024,
+                    )
+                    val_cached_text_embeddings[txt] = {'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}
+                # compute empty embedding
+                prompt_embeds, prompt_embeds_mask = text_encoding_pipeline_val.encode_prompt(
+                    prompt=[' '],
+                    device=text_encoding_pipeline_val.device,
+                    num_images_per_prompt=1,
+                    max_sequence_length=1024,
+                )
+                val_cached_text_embeddings['empty_embedding'] = {'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}
+            text_encoding_pipeline_val.to("cpu")
+            torch.cuda.empty_cache()
+            del text_encoding_pipeline_val
+            gc.collect()
+
+        if args.precompute_image_embeddings and hasattr(args.validation_config, 'img_dir'):
+            # Precompute validation image embeddings
+            val_cached_image_embeddings = {}
+            vae_val = AutoencoderKLQwenImage.from_pretrained(
+                args.pretrained_model_name_or_path,
+                subfolder="vae",
+            )
+            vae_val.to(accelerator.device, dtype=weight_dtype)
+            with torch.no_grad():
+                for img_name in tqdm([i for i in os.listdir(args.validation_config.img_dir) if ".png" in i or ".jpg" in i]):
+                    img = Image.open(os.path.join(args.validation_config.img_dir, img_name)).convert('RGB')
+                    img = image_resize(img, args.validation_config.img_size)
+                    w, h = img.size
+                    new_w = (w // 32) * 32
+                    new_h = (h // 32) * 32
+                    img = img.resize((new_w, new_h))
+                    img = torch.from_numpy((np.array(img) / 127.5) - 1)
+                    img = img.permute(2, 0, 1).unsqueeze(0)
+                    pixel_values = img.unsqueeze(2)
+                    pixel_values = pixel_values.to(dtype=weight_dtype).to(accelerator.device)
+
+                    pixel_latents = vae_val.encode(pixel_values).latent_dist.sample().to('cpu')[0]
+                    val_cached_image_embeddings[img_name] = pixel_latents
+            vae_val.to('cpu')
+            torch.cuda.empty_cache()
+            del vae_val
+            gc.collect()
+
+        validation_dataloader = loader(
+            cached_text_embeddings=val_cached_text_embeddings,
+            cached_image_embeddings=val_cached_image_embeddings,
+            **args.validation_config
+        )
+        logger.info(f"Validation dataset loaded with {len(validation_dataloader)} batches")
 
     # Calculate total number of epochs
     total_samples = len(train_dataloader.dataset) if hasattr(train_dataloader, 'dataset') else len(train_dataloader)
@@ -311,6 +488,12 @@ def main():
             "precompute_image_embeddings": args.precompute_image_embeddings,
         }
 
+        # Add validation config to W&B if available
+        if hasattr(args, 'validation_config') and args.validation_config is not None:
+            wandb_config["validation_batch_size"] = args.validation_config.get("train_batch_size", "N/A")
+            wandb_config["validation_img_size"] = args.validation_config.get("img_size", "N/A")
+            wandb_config["validation_img_dir"] = args.validation_config.get("img_dir", "N/A")
+
         # Add W&B specific config if available
         if hasattr(args, 'wandb_project_name'):
             wandb_config["wandb_project_name"] = args.wandb_project_name
@@ -330,6 +513,11 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total epochs: {total_epochs}")
+    if validation_dataloader:
+        logger.info(f"  Validation enabled with batch size: {args.validation_config.get('train_batch_size', 'N/A')}")
+        logger.info(f"  Validation image size: {args.validation_config.get('img_size', 'N/A')}")
+        logger.info(f"  Validation data directory: {args.validation_config.get('img_dir', 'N/A')}")
+
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -378,7 +566,6 @@ def main():
                         pixel_latents.device, pixel_latents.dtype
                     )
                     pixel_latents = (pixel_latents - latents_mean) * latents_std
-
 
                     bsz = pixel_latents.shape[0]
                     noise = torch.randn_like(pixel_latents, device=accelerator.device, dtype=weight_dtype)
@@ -515,6 +702,21 @@ def main():
 
                     logger.info(f"Saved state to {save_path}")
 
+                    # Perform validation if validation dataset is available
+                    if validation_dataloader:
+                        logger.info("Computing validation loss...")
+                        val_loss = compute_validation_loss(
+                            flux_transformer, vae, text_encoding_pipeline, noise_scheduler_copy,
+                            validation_dataloader, accelerator, weight_dtype, get_sigmas
+                        )
+                        logger.info(f"Validation loss at step {global_step}: {val_loss:.6f}")
+
+                        # Log validation loss to W&B
+                        accelerator.log({
+                            "validation_loss": val_loss,
+                            "global_step": global_step,
+                        }, step=global_step)
+
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
@@ -531,11 +733,29 @@ def main():
             }, step=global_step)
             logger.info(f"Epoch {current_epoch} completed. Average loss: {avg_epoch_loss:.4f}")
 
+            # Perform validation at the end of each epoch if validation dataset is available
+            if validation_dataloader:
+                logger.info(f"Computing validation loss for epoch {current_epoch}...")
+                val_loss = compute_validation_loss(
+                    flux_transformer, vae, text_encoding_pipeline, noise_scheduler_copy,
+                    validation_dataloader, accelerator, weight_dtype, get_sigmas
+                )
+                logger.info(f"Epoch {current_epoch} validation loss: {val_loss:.6f}")
+
+                # Log epoch validation loss to W&B
+                accelerator.log({
+                    "epoch_validation_loss": val_loss,
+                    "epoch": current_epoch,
+                    "epoch_complete": True,
+                }, step=global_step)
+
             # Log additional epoch statistics
             if accelerator.is_main_process:
                 logger.info(f"Epoch {current_epoch} Summary:")
                 logger.info(f"  - Steps completed: {epoch_step_count}")
                 logger.info(f"  - Average loss: {avg_epoch_loss:.6f}")
+                if validation_dataloader:
+                    logger.info(f"  - Validation loss: {val_loss:.6f}")
                 logger.info(f"  - Current learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
                 logger.info(f"  - Global step: {global_step}")
                 logger.info(f"  - Progress: {global_step}/{args.max_train_steps} ({100*global_step/args.max_train_steps:.1f}%)")
