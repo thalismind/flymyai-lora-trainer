@@ -96,11 +96,26 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
 
     with torch.no_grad():
         for val_batch in validation_dataloader:
+            if num_val_batches == 0:  # Log batch structure only once
+                logger.info(f"Validation batch structure: {len(val_batch)} items")
+                if len(val_batch) == 3:
+                    logger.info("Batch contains: [image_embeddings, text_embeddings, text_masks]")
+                elif len(val_batch) == 2:
+                    logger.info("Batch contains: [raw_images, raw_texts]")
+                else:
+                    logger.warning(f"Unexpected batch structure with {len(val_batch)} items")
+
             if len(val_batch) == 3:  # With cached embeddings
                 img, prompt_embeds, prompt_embeds_mask = val_batch
                 prompt_embeds, prompt_embeds_mask = prompt_embeds.to(dtype=weight_dtype).to(accelerator.device), prompt_embeds_mask.to(dtype=torch.int32).to(accelerator.device)
+                if num_val_batches == 0:  # Log only once
+                    logger.info("Using cached validation embeddings")
             else:  # Without cached embeddings
                 img, prompts = val_batch
+                if num_val_batches == 0:  # Log only once
+                    logger.info("Computing validation embeddings on-the-fly")
+                if text_encoding_pipeline is None:
+                    raise ValueError("text_encoding_pipeline is required when not using cached embeddings")
                 prompt_embeds, prompt_embeds_mask = text_encoding_pipeline.encode_prompt(
                     prompt=prompts,
                     device=accelerator.device,
@@ -111,7 +126,11 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             # Handle image processing
             if isinstance(img, torch.Tensor):  # Cached embeddings
                 pixel_latents = img.to(dtype=weight_dtype).to(accelerator.device)
+                if num_val_batches == 0:  # Log only once
+                    logger.info("Using cached validation image embeddings")
             else:  # Raw images
+                if num_val_batches == 0:  # Log only once
+                    logger.info("Computing validation image embeddings on-the-fly")
                 pixel_values = img.to(dtype=weight_dtype).to(accelerator.device)
                 pixel_values = pixel_values.unsqueeze(2)
                 pixel_latents = vae.encode(pixel_values).latent_dist.sample()
@@ -187,6 +206,7 @@ def compute_validation_loss(flux_transformer, vae, text_encoding_pipeline, noise
             num_val_batches += 1
 
     avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0.0
+    logger.info(f"Validation completed: {num_val_batches} batches, average loss: {avg_val_loss:.6f}")
     flux_transformer.train()
     return avg_val_loss
 
@@ -262,6 +282,8 @@ def main():
             cached_text_embeddings['empty_embedding'] = {'prompt_embeds': prompt_embeds[0].to('cpu'), 'prompt_embeds_mask': prompt_embeds_mask[0].to('cpu')}
         text_encoding_pipeline.to("cpu")
         torch.cuda.empty_cache()
+    # Delete text_encoding_pipeline since validation will handle its own needs
+    # If validation needs text encoding and we don't have cached embeddings, it will create a new one
     del text_encoding_pipeline
     gc.collect()
 
@@ -378,13 +400,16 @@ def main():
 
         if args.precompute_text_embeddings and hasattr(args.validation_config, 'img_dir'):
             # Precompute validation text embeddings
+            logger.info("Precomputing validation text embeddings...")
             val_cached_text_embeddings = {}
             text_encoding_pipeline_val = QwenImagePipeline.from_pretrained(
                 args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
             )
             text_encoding_pipeline_val.to(accelerator.device)
             with torch.no_grad():
-                for txt in tqdm([i for i in os.listdir(args.validation_config.img_dir) if ".txt" in i]):
+                txt_files = [i for i in os.listdir(args.validation_config.img_dir) if ".txt" in i]
+                logger.info(f"Found {len(txt_files)} text files for validation")
+                for txt in tqdm(txt_files, desc="Precomputing validation text embeddings"):
                     txt_path = os.path.join(args.validation_config.img_dir, txt)
                     prompt = open(txt_path).read()
                     prompt_embeds, prompt_embeds_mask = text_encoding_pipeline_val.encode_prompt(
@@ -406,9 +431,11 @@ def main():
             torch.cuda.empty_cache()
             del text_encoding_pipeline_val
             gc.collect()
+            logger.info(f"Precomputed {len(val_cached_text_embeddings)} validation text embeddings")
 
         if args.precompute_image_embeddings and hasattr(args.validation_config, 'img_dir'):
             # Precompute validation image embeddings
+            logger.info("Precomputing validation image embeddings...")
             val_cached_image_embeddings = {}
             vae_val = AutoencoderKLQwenImage.from_pretrained(
                 args.pretrained_model_name_or_path,
@@ -416,7 +443,9 @@ def main():
             )
             vae_val.to(accelerator.device, dtype=weight_dtype)
             with torch.no_grad():
-                for img_name in tqdm([i for i in os.listdir(args.validation_config.img_dir) if ".png" in i or ".jpg" in i]):
+                img_files = [i for i in os.listdir(args.validation_config.img_dir) if ".png" in i or ".jpg" in i]
+                logger.info(f"Found {len(img_files)} image files for validation")
+                for img_name in tqdm(img_files, desc="Precomputing validation image embeddings"):
                     img = Image.open(os.path.join(args.validation_config.img_dir, img_name)).convert('RGB')
                     img = image_resize(img, args.validation_config.img_size)
                     w, h = img.size
@@ -434,6 +463,7 @@ def main():
             torch.cuda.empty_cache()
             del vae_val
             gc.collect()
+            logger.info(f"Precomputed {len(val_cached_image_embeddings)} validation image embeddings")
 
         validation_dataloader = loader(
             cached_text_embeddings=val_cached_text_embeddings,
@@ -441,6 +471,17 @@ def main():
             **args.validation_config
         )
         logger.info(f"Validation dataset loaded with {len(validation_dataloader)} batches")
+
+        # Log validation setup summary
+        if val_cached_text_embeddings:
+            logger.info(f"✓ Validation text embeddings: {len(val_cached_text_embeddings)} cached")
+        else:
+            logger.info("✗ Validation text embeddings: not cached (will be computed on-the-fly)")
+
+        if val_cached_image_embeddings:
+            logger.info(f"✓ Validation image embeddings: {len(val_cached_image_embeddings)} cached")
+        else:
+            logger.info("✗ Validation image embeddings: not cached (will be computed on-the-fly)")
 
     # Calculate total number of epochs
     total_samples = len(train_dataloader.dataset) if hasattr(train_dataloader, 'dataset') else len(train_dataloader)
@@ -702,11 +743,23 @@ def main():
 
                     logger.info(f"Saved state to {save_path}")
 
-                    # Perform validation if validation dataset is available
+                                        # Perform validation if validation dataset is available
                     if validation_dataloader:
                         logger.info("Computing validation loss...")
+                        # Only create text encoding pipeline if we don't have cached embeddings
+                        val_text_pipeline = None
+                        if not args.precompute_text_embeddings:
+                            if 'text_encoding_pipeline' in locals():
+                                val_text_pipeline = text_encoding_pipeline
+                            else:
+                                # Create a new one for validation only if needed
+                                val_text_pipeline = QwenImagePipeline.from_pretrained(
+                                    args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
+                                )
+                                val_text_pipeline.to(accelerator.device)
+
                         val_loss = compute_validation_loss(
-                            flux_transformer, vae, text_encoding_pipeline, noise_scheduler_copy,
+                            flux_transformer, vae, val_text_pipeline, noise_scheduler_copy,
                             validation_dataloader, accelerator, weight_dtype, get_sigmas
                         )
                         logger.info(f"Validation loss at step {global_step}: {val_loss:.6f}")
@@ -716,6 +769,11 @@ def main():
                             "validation_loss": val_loss,
                             "global_step": global_step,
                         }, step=global_step)
+
+                        # Clean up temporary text pipeline if we created one
+                        if val_text_pipeline is not None and val_text_pipeline != text_encoding_pipeline:
+                            del val_text_pipeline
+                            torch.cuda.empty_cache()
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -733,11 +791,23 @@ def main():
             }, step=global_step)
             logger.info(f"Epoch {current_epoch} completed. Average loss: {avg_epoch_loss:.4f}")
 
-            # Perform validation at the end of each epoch if validation dataset is available
+                        # Perform validation at the end of each epoch if validation dataset is available
             if validation_dataloader:
                 logger.info(f"Computing validation loss for epoch {current_epoch}...")
+                # Only create text encoding pipeline if we don't have cached embeddings
+                val_text_pipeline = None
+                if not args.precompute_text_embeddings:
+                    if 'text_encoding_pipeline' in locals():
+                        val_text_pipeline = text_encoding_pipeline
+                    else:
+                        # Create a new one for validation only if needed
+                        val_text_pipeline = QwenImagePipeline.from_pretrained(
+                            args.pretrained_model_name_or_path, transformer=None, vae=None, torch_dtype=weight_dtype
+                        )
+                        val_text_pipeline.to(accelerator.device)
+
                 val_loss = compute_validation_loss(
-                    flux_transformer, vae, text_encoding_pipeline, noise_scheduler_copy,
+                    flux_transformer, vae, val_text_pipeline, noise_scheduler_copy,
                     validation_dataloader, accelerator, weight_dtype, get_sigmas
                 )
                 logger.info(f"Epoch {current_epoch} validation loss: {val_loss:.6f}")
@@ -748,6 +818,11 @@ def main():
                     "epoch": current_epoch,
                     "epoch_complete": True,
                 }, step=global_step)
+
+                # Clean up temporary text pipeline if we created one
+                if val_text_pipeline is not None and val_text_pipeline != text_encoding_pipeline:
+                    del val_text_pipeline
+                    torch.cuda.empty_cache()
 
             # Log additional epoch statistics
             if accelerator.is_main_process:
