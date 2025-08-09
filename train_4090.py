@@ -342,11 +342,13 @@ def main():
     current_epoch = 0
     epoch_loss = 0.0
     epoch_step_count = 0
+    train_loss = 0.0  # Initialize train_loss here
 
     for epoch in range(total_epochs):
         current_epoch = epoch + 1
         epoch_loss = 0.0
         epoch_step_count = 0
+        train_loss = 0.0  # Reset train_loss for each epoch
 
         logger.info(f"Starting epoch {current_epoch}/{total_epochs}")
 
