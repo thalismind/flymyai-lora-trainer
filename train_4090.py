@@ -258,7 +258,7 @@ def main():
 
     # Add optimizer-specific parameters to W&B config
     if hasattr(args, 'optimizer_args'):
-        wandb_config["optimizer_args"] = json.dumps(args.optimizer_args)
+        wandb_config["optimizer_args"] = args.optimizer_args
 
     # Add validation config to W&B if available
     if hasattr(args, 'validation_config') and args.validation_config is not None:
