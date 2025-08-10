@@ -34,4 +34,5 @@ class CustomWandbTracker(GeneralTracker):
 
     @on_main_process
     def log(self, values: dict, step: Optional[int] = None):
+        print(f"Logging to W&B: {values} at step {step}")
         wandb.log(values, step=step)

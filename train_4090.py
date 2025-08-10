@@ -806,9 +806,7 @@ def main():
                 accelerator.log({
                     "train_loss": train_loss,
                     "learning_rate": current_lr,
-                    "epoch": current_epoch,
                     "epoch_progress": epoch_step_count / steps_per_epoch,
-                    "global_step": global_step,
                 }, step=global_step)
 
                 train_loss = 0.0
@@ -881,7 +879,7 @@ def main():
                         # Log validation loss to W&B
                         accelerator.log({
                             "validation_loss": val_loss,
-                            "global_step": global_step,
+                            "epoch_progress": epoch_step_count / steps_per_epoch,
                         }, step=global_step)
 
                         # Clean up temporary text pipeline if we created one
@@ -900,8 +898,7 @@ def main():
             avg_epoch_loss = epoch_loss / epoch_step_count
             accelerator.log({
                 "epoch_loss": avg_epoch_loss,
-                "epoch": current_epoch,
-                "epoch_complete": True,
+                "epoch_progress": epoch_step_count / steps_per_epoch,
             }, step=global_step)
             logger.info(f"Epoch {current_epoch} completed. Average loss: {avg_epoch_loss:.4f}")
 
@@ -930,8 +927,7 @@ def main():
                 # Log epoch validation loss to W&B
                 accelerator.log({
                     "epoch_validation_loss": val_loss,
-                    "epoch": current_epoch,
-                    "epoch_complete": True,
+                    "epoch_progress": epoch_step_count / steps_per_epoch,
                 }, step=global_step)
 
                 # Clean up temporary text pipeline if we created one
@@ -957,13 +953,6 @@ def main():
         logger.info(f"Total epochs: {current_epoch}")
         logger.info(f"Final learning rate: {lr_scheduler.get_last_lr()[0]:.2e}")
 
-        # Log final metrics
-        accelerator.log({
-            "training_complete": True,
-            "final_global_step": global_step,
-            "final_epoch": current_epoch,
-            "final_learning_rate": lr_scheduler.get_last_lr()[0],
-        }, step=global_step)
 
     accelerator.wait_for_everyone()
     accelerator.end_training()
