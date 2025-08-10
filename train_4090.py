@@ -308,6 +308,7 @@ def main():
         diffusers.utils.logging.set_verbosity_error()
 
     if accelerator.is_main_process:
+        accelerator.init_trackers(args.wandb_project_name, config=wandb_config)
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     weight_dtype = torch.float32
