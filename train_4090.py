@@ -1,6 +1,7 @@
 import argparse
 import copy
 from copy import deepcopy
+import json
 import logging
 import os
 import shutil
@@ -38,6 +39,7 @@ import bitsandbytes as bnb
 logger = get_logger(__name__, log_level="INFO")
 from diffusers.loaders import AttnProcsLayers
 import gc
+from custom_wandb_tracker import CustomWandbTracker
 
 
 def parse_args():
@@ -246,12 +248,42 @@ def main():
     args = OmegaConf.load(parse_args())
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
+    # Initialize W&B tracking with more comprehensive config
+    wandb_config = {
+        key: value for key, value in args.items() if key not in ['wandb_run_name', 'wandb_project_name', 'wandb_entity', 'wandb_tags']
+        # "total_epochs": total_epochs,
+        # "steps_per_epoch": steps_per_epoch,
+        # "optimizer": getattr(args, 'optimizer', 'adam'),
+    }
+
+    # Add optimizer-specific parameters to W&B config
+    if hasattr(args, 'optimizer_args'):
+        wandb_config["optimizer_args"] = json.dumps(args.optimizer_args)
+
+    # Add validation config to W&B if available
+    if hasattr(args, 'validation_config') and args.validation_config is not None:
+        wandb_config["validation_batch_size"] = args.validation_config.get("train_batch_size", "N/A")
+        wandb_config["validation_img_size"] = args.validation_config.get("img_size", "N/A")
+        wandb_config["validation_img_dir"] = args.validation_config.get("img_dir", "N/A")
+
+    # Initialize custom W&B tracker
+    wandb_tracker = CustomWandbTracker(
+        run_name=args.wandb_run_name,
+        project_name=args.wandb_project_name,
+        entity=args.wandb_entity,
+        tags=args.wandb_tags,
+        config=wandb_config,
+    )
+
+    wandb_tracker.store_init_configuration(wandb_config)
+
+
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
-        log_with=args.report_to,
+        log_with=[wandb_tracker],
         project_config=accelerator_project_config,
     )
     def unwrap_model(model):
@@ -453,7 +485,6 @@ def main():
                     scale_parameter=optimizer_args.get('scale_parameter', True),
                     relative_step=optimizer_args.get('relative_step', True),
                     warmup_init=optimizer_args.get('warmup_init', True),
-                    lr=optimizer_args.get('lr', args.learning_rate),
                 )
             except ImportError:
                 logger.warning("Adafactor not available, falling back to AdamW")
@@ -485,16 +516,7 @@ def main():
                     d_coef=optimizer_args.get('d_coef', 0.1),
                 )
             except ImportError:
-                logger.warning("Prodigy not available, falling back to AdamW")
-                optimizer_type = 'adam'
-                optimizer_cls = torch.optim.AdamW
-                optimizer = optimizer_cls(
-                    lora_layers,
-                    lr=args.learning_rate,
-                    betas=tuple(optimizer_args.get('betas', [0.9, 0.999])),
-                    weight_decay=optimizer_args.get('weight_decay', 0.01),
-                    eps=optimizer_args.get('epsilon', 1e-8),
-                )
+                raise ImportError("Prodigy not available, please install it with `pip install prodigyopt`")
         else:
             logger.warning(f"Unknown optimizer type '{optimizer_type}', falling back to AdamW")
             optimizer_type = 'adam'
@@ -507,7 +529,7 @@ def main():
                 eps=optimizer_args.get('epsilon', 1e-8),
             )
 
-    logger.info(f"Using {optimizer_type.upper()} optimizer")
+    logger.info(f"Using {optimizer_type.title()} optimizer")
     train_dataloader = loader(cached_text_embeddings=cached_text_embeddings, cached_image_embeddings=cached_image_embeddings, **args.data_config)
 
     # Setup validation dataset if validation_config is provided
@@ -638,43 +660,6 @@ def main():
     )
 
     initial_global_step = 0
-
-    if accelerator.is_main_process:
-        # Initialize W&B tracking with more comprehensive config
-        wandb_config = {
-            "model": args.pretrained_model_name_or_path,
-            "learning_rate": args.learning_rate,
-            "lr_scheduler": args.lr_scheduler,
-            "lr_warmup_steps": args.lr_warmup_steps,
-            "train_batch_size": args.train_batch_size,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "max_train_steps": args.max_train_steps,
-            "total_epochs": total_epochs,
-            "steps_per_epoch": steps_per_epoch,
-            "mixed_precision": args.mixed_precision,
-            "rank": args.rank,
-            "checkpointing_steps": args.checkpointing_steps,
-            "quantize": args.quantize,
-            "adam8bit": args.adam8bit,
-            "precompute_text_embeddings": args.precompute_text_embeddings,
-            "precompute_image_embeddings": args.precompute_image_embeddings,
-            "optimizer": getattr(args, 'optimizer', 'adam'),
-        }
-
-        # Add optimizer-specific parameters to W&B config
-        if hasattr(args, 'optimizer_args'):
-            for key, value in args.optimizer_args.items():
-                wandb_config[f"optimizer_{key}"] = value
-
-        # Add validation config to W&B if available
-        if hasattr(args, 'validation_config') and args.validation_config is not None:
-            wandb_config["validation_batch_size"] = args.validation_config.get("train_batch_size", "N/A")
-            wandb_config["validation_img_size"] = args.validation_config.get("img_size", "N/A")
-            wandb_config["validation_img_dir"] = args.validation_config.get("img_dir", "N/A")
-
-        # Add W&B specific config if available
-        accelerator.init_trackers(args.wandb_project_name, wandb_config, name=args.wandb_run_name, entity=args.wandb_entity, tags=args.wandb_tags)
-
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
